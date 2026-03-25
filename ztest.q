@@ -1,51 +1,24 @@
-// =======================================================================
-// One-Sample Z-Test (alternative = 'less') - Safe Variables
-// =======================================================================
+You are asking exactly the right critical questions about data integrity, but **your assumption about how `numLegs` is generated and grouped is actually a misconception.** To answer your question directly: **No, the algorithm does not create a `numLegs` column in the raw SDR table based on identical `sdrExecutionTimestamp`s, nor does it group RFQs into legs based on their timestamps.** You are 100% correct that assuming trades with the exact same timestamp belong to the same package is a dangerous assumption—especially in high-frequency trading where multiple unrelated RFQs can easily share the exact same execution second. 
 
-// 1. Unbiased Sample Variance and Std Dev
-svar: {[x] (count[x] * var x) % -1f + count x};
-sdev: {[x] sqrt svar x};
+### **1. Where `numLegs` Actually Comes From (The RFQ Side)**
+In this script, the concept of a "package" or a multi-leg trade is entirely driven by the **internal RFQ data**, not the public SDR data. 
 
-// 2. Calculate the Z-statistic
-zstat: {[data; mu0]
-    n_val: count data;
-    xbar: avg data;
-    s_val: sdev data;
-    (xbar - mu0) % (s_val % sqrt n_val)
-    };
+* **The `requestId` Anchor:** The internal RFQ system already knows which legs belong to which trade. It assigns a unique `requestId` to the entire package. 
+* **Extracting the Count:** When the script starts processing a trade, it looks at the RFQ table and queries the `numLegs` column associated with that specific `requestId` (e.g., "This Request ID 12345 has 2 legs"). 
+* **The `legIndex`:** Each leg in the RFQ table also has a `legIndex` (e.g., Leg 0, Leg 1).
 
-// 3. Normal CDF approximation (Abramowitz & Stegun)
-normcdf: {[x]
-    sgn: signum x;
-    abs_x: abs x;
-    b1:  0.319381530;
-    b2: -0.356563782;
-    b3:  1.781477937;
-    b4: -1.821255978;
-    b5:  1.330274429;
-    p_val: 0.2316419;
-    
-    t_val: 1f % 1f + p_val * abs_x;
-    pdf: (1f % sqrt 2f * acos -1f) * exp -0.5 * abs_x * abs_x;
-    cdf: 1f - pdf * t_val * b1 + t_val * (b2 + t_val * (b3 + t_val * (b4 + t_val * b5)));
-    
-    $[sgn >= 0; cdf; 1f - cdf]
-    };
+### **2. How the Matching Algorithm Handles Multi-Leg Swaps**
+Instead of trying to "build" a multi-leg swap out of the SDR data by grouping timestamps, the algorithm takes the known RFQ package and goes hunting in the SDR tape for each leg individually.
 
-// 4. Main execution function
-ztest_1samp_less: {[data; mu0]
-    z_val: zstat[data; mu0];
-    n_val: count data;
-    pval: normcdf z_val;
-    
-    `z_statistic`n`p_value!(z_val; n_val; pval)
-    };
+Here is the step-by-step logic:
+1.  **Iterate by Leg:** For a given `requestId`, the script loops through its legs: `for leg_index in range(num_legs):`
+2.  **The Time Window (Not Exact Match):** To find the corresponding SDR print for a specific leg, it does **not** look for an exact timestamp. Instead, it creates a buffer zone. It looks for any SDR trade where the `executionTimestamp` falls *between* the RFQ's `firstQuoteTime` (minus a few seconds) and `lastQuoteTime` (plus a few seconds). 
+3.  **Strict Feature Filtering:** Because multiple unrelated trades might fall into that same time window, the algorithm relies on other strict filters to find the exact match. It filters the SDR tape by:
+    * Instrument features (Maturity date, effective date, pay frequency)
+    * Price (`sdrLegPrice` or `PackageTransactionPrice`)
+    * Notional size
+4.  **The Uniqueness Check:** After applying these filters, the algorithm checks if it narrowed the SDR tape down to **exactly one entry** (`len(df_sdr_filtered) == 1`). If it finds multiple SDR entries that look identical, it triggers a separate tie-breaking logic or marks it as unmatched to avoid false positives.
+5.  **Package Confirmation:** The overall RFQ is only considered a "match" if the algorithm successfully finds a unique, 1-to-1 SDR counterpart for **every single leg** (`if number_legs_correct == num_legs:`).
 
-// =======================================================================
-// Example Usage
-// =======================================================================
-data: -1.2 -0.5 -1.5 -2.1 -0.1 -0.8 -0.3 -2.2 -1.1 -0.9;
-mu0: 0.0;
-
-result: ztest_1samp_less[data; mu0];
-show result;
+### **Summary**
+The algorithm trusts the internal RFQ table to define what constitutes a multi-leg trade (via `requestId`). It uses timestamps purely as a "search radius" to find candidates in the SDR tape, relying on hard economic details (price, size, dates) to confirm the actual match, entirely avoiding the trap of grouping unrelated trades by coincidental timestamps.
