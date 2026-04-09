@@ -1,5 +1,6 @@
 import logging
 import pandas as pd
+import numpy as np
 from tqdm import tqdm
 
 from swaps_analytics.irs.mifid_matching.mifid_constants import (
@@ -7,12 +8,6 @@ from swaps_analytics.irs.mifid_matching.mifid_constants import (
     MifidColumns,
     RfqColumns,
     MatchAttributes
-)
-from swaps_analytics.irs.mifid_matching.mifid_matching_utils import (
-    filter_mifid_by_time_window,
-    filter_mifid_by_exact_notional,
-    filter_mifid_by_maturity_year,
-    tie_breaking_closest_time
 )
 
 class MifidDataMatchingAlgorithm:
@@ -56,6 +51,37 @@ class MifidDataMatchingAlgorithm:
             df[MifidColumns.notionalAmount.value] = df[MifidColumns.notionalAmount.value].str.replace(',', '').astype(float)
         return df
 
+    @staticmethod
+    def filter_mifid_by_time_window(df_mifid: pd.DataFrame, time_col: str, ref_time: pd.Timestamp, backward_mins: int, forward_mins: int) -> pd.DataFrame:
+        start_time = ref_time - pd.Timedelta(minutes=backward_mins)
+        end_time = ref_time + pd.Timedelta(minutes=forward_mins)
+        return df_mifid[(df_mifid[time_col] >= start_time) & (df_mifid[time_col] <= end_time)]
+
+    @staticmethod
+    def filter_mifid_by_exact_notional(df_mifid: pd.DataFrame, notional_col: str, ref_notional: float, tolerance: float) -> pd.DataFrame:
+        return df_mifid[
+            (df_mifid[notional_col] >= ref_notional - tolerance) & 
+            (df_mifid[notional_col] <= ref_notional + tolerance)
+        ]
+
+    @staticmethod
+    def filter_mifid_by_maturity_year(df_mifid: pd.DataFrame, expiry_col: str, ref_maturity_date: pd.Timestamp) -> pd.DataFrame:
+        # Drop NaNs first to safely check the year
+        df_filtered = df_mifid.dropna(subset=[expiry_col]).copy()
+        if df_filtered.empty:
+            return df_filtered
+        
+        ref_year = pd.to_datetime(ref_maturity_date).year
+        df_filtered['Drv Expiry Year'] = pd.to_datetime(df_filtered[expiry_col]).dt.year
+        return df_filtered[df_filtered['Drv Expiry Year'] == ref_year]
+
+    @staticmethod
+    def tie_breaking_closest_time(df_mifid: pd.DataFrame, time_col: str, ref_time: pd.Timestamp) -> pd.DataFrame:
+        df_mifid = df_mifid.copy()
+        time_diffs = abs((df_mifid[time_col] - ref_time).dt.total_seconds())
+        min_diff = time_diffs.min()
+        return df_mifid[time_diffs == min_diff].head(1)
+
     def match_mifid_trades(self) -> pd.DataFrame:
         matched_results = []
         
@@ -64,6 +90,9 @@ class MifidDataMatchingAlgorithm:
         for trade_date in unique_dates:
             df_rfq_date = self.rfq_data[self.rfq_data[RfqColumns.date.value] == trade_date]
             matches_for_date = 0
+            
+            # Pre-filter MiFID data for the current date to make prints and filtering cleaner/faster
+            mifid_date_base = self.mifid_data[self.mifid_data[MifidColumns.tradingDateTime.value].dt.date == trade_date]
             
             for request_id in tqdm(
                 df_rfq_date[RfqColumns.rfqId.value].unique(),
@@ -74,43 +103,70 @@ class MifidDataMatchingAlgorithm:
                 rfq_time = rfq_row[RfqColumns.datetime_parsed.value]
                 rfq_size = rfq_row[RfqColumns.sizeK.value]
                 rfq_maturity = rfq_row[RfqColumns.legInstrumentMaturityDate.value]
+                rfq_venue = rfq_row[RfqColumns.venue.value]
+                rfq_currency = rfq_row[RfqColumns.legCurrency.value]
+                
+                print(f"\n--- Matching RFQ ID: {request_id} ---")
+                initial_len = len(mifid_date_base)
                 
                 # 1. Filter by Time Window
-                mifid_filtered = filter_mifid_by_time_window(
-                    df_mifid=self.mifid_data,
+                mifid_filtered = self.filter_mifid_by_time_window(
+                    df_mifid=mifid_date_base,
                     time_col=MifidColumns.tradingDateTime.value,
                     ref_time=rfq_time,
                     backward_mins=self.backward_timedelta,
                     forward_mins=self.forward_timedelta
                 )
-                
+                current_len = len(mifid_filtered)
+                print(f"1. Time Window Filter  | Filtered out: {initial_len - current_len:<5} | Left: {current_len}")
                 if mifid_filtered.empty:
                     continue
+                initial_len = current_len
+                
+                # 2. Filter by Venue (Source)
+                mifid_filtered = mifid_filtered[mifid_filtered[MifidColumns.source.value] == rfq_venue]
+                current_len = len(mifid_filtered)
+                print(f"2. Venue Filter        | Filtered out: {initial_len - current_len:<5} | Left: {current_len}")
+                if mifid_filtered.empty:
+                    continue
+                initial_len = current_len
+
+                # 3. Filter by Currency
+                mifid_filtered = mifid_filtered[mifid_filtered[MifidColumns.currency.value] == rfq_currency]
+                current_len = len(mifid_filtered)
+                print(f"3. Currency Filter     | Filtered out: {initial_len - current_len:<5} | Left: {current_len}")
+                if mifid_filtered.empty:
+                    continue
+                initial_len = current_len
                     
-                # 2. Filter by Exact Notional
-                mifid_filtered = filter_mifid_by_exact_notional(
+                # 4. Filter by Exact Notional
+                mifid_filtered = self.filter_mifid_by_exact_notional(
                     df_mifid=mifid_filtered,
                     notional_col=MifidColumns.notionalAmount.value,
                     ref_notional=rfq_size,
                     tolerance=config.NOTIONAL_TOLERANCE
                 )
-                
+                current_len = len(mifid_filtered)
+                print(f"4. Exact Notional Filter| Filtered out: {initial_len - current_len:<5} | Left: {current_len}")
                 if mifid_filtered.empty:
                     continue
+                initial_len = current_len
                     
-                # 3. Filter by Maturity Year
-                mifid_filtered = filter_mifid_by_maturity_year(
+                # 5. Filter by Maturity Year (handles NaN by dropping them internally)
+                mifid_filtered = self.filter_mifid_by_maturity_year(
                     df_mifid=mifid_filtered,
                     expiry_col=MifidColumns.drvExpiryDate.value,
                     ref_maturity_date=rfq_maturity
                 )
-                
+                current_len = len(mifid_filtered)
+                print(f"5. Maturity Year Filter | Filtered out: {initial_len - current_len:<5} | Left: {current_len}")
                 if mifid_filtered.empty:
                     continue
 
-                # 4. Tie-Breaking Logic (Closest Time)
+                # 6. Tie-Breaking Logic (Closest Time)
                 if len(mifid_filtered) > 1:
-                    mifid_filtered = tie_breaking_closest_time(
+                    print(f"-> Tie-breaker needed for {len(mifid_filtered)} rows. Selecting closest time.")
+                    mifid_filtered = self.tie_breaking_closest_time(
                         df_mifid=mifid_filtered,
                         time_col=MifidColumns.tradingDateTime.value,
                         ref_time=rfq_time
