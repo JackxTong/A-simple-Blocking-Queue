@@ -13,11 +13,6 @@ from swaps_analytics.irs.sdr_matching.sdr_constants import RfqColumns
 
 class ExtractSwapSdrDataFromKdb:
     def __init__(self, start_date: datetime.date, end_date: datetime.date, currency: CurrencyEnum, env: EnvType):
-        """
-        This class is used to fetch desired data (RFQ and SDR) from KDB for given dates
-        :param start_date:    start date of the period for which data is to be fetched
-        :param end_date:      end date of the period for which data is to be fetched
-        """
         self.start_date = start_date
         self.end_date = end_date
         self.gateway_connection = ConnectionDetailsBuilder(AssetClass.RATES).set_env_type(env).build()
@@ -28,7 +23,6 @@ class ExtractSwapSdrDataFromKdb:
             CurrencyEnum.GBP: "GBP*",
             CurrencyEnum.USD: "USD-SOFR*",
         }
-
         self.LEG_CONSTRAINT_PREFIX = {
             CurrencyEnum.EUR: "*InterestRateSwap/EUR*",
             CurrencyEnum.GBP: "*InterestRateSwap/GBP*",
@@ -55,9 +49,9 @@ class ExtractSwapSdrDataFromKdb:
                     .constr.FBY[=;`revisionNumber;max;`requestId];
                     .grp.FIELD[`requestId`legIndex];
                     .fstat.FIELDLASTAS[`date; `tradeDate],
-                    .fstat.FIELDLAST[`numLegs`requestType`enquiryType`riskOwnerBook`legInstrumentType`regulatoryScope`clientName`legInstrumentName`legInstrumentMaturityDate],
+                    .fstat.FIELDLAST[`numLegs`requestType`enquiryType`legInstrumentType`regulatoryScope`legInstrumentName`legInstrumentMaturityDate],
                     .fstat.FIELDLAST[`legSwapEffectiveDate`legPricingConvention`parentQuotePrice`parentQuoteMidPrice`parentQuoteMidPriceSource`legQuotePrice`legQuoteMidPrice],
-                    .fstat.FIELDLAST[`legCoverPrice`parentCoverPrice`legDealerSide`endReason`parentDealerSide`legSwapFloatingLegFrequency`legSwapFloatingLegResetFrequency],
+                    .fstat.FIELDLAST[`legDealerSide`endReason`parentDealerSide`legSwapFloatingLegFrequency`legSwapFloatingLegResetFrequency],
                     .fstat.FIELDLAST[`legSwapFloatingLegIndex`legSwapFixedLegCouponFrequency`endQuoteRank`endQuoteTiedStatus`legSize`legDv01`legSwapFixedLegRate],
                     .fstat.FIELDLASTAS[("p"$; `sourceTimestamp); `sourceTimestamp],
                     .fstat.FIELDFIRSTAS[("p"$; `eventTime); `firstQuoteTime]);
@@ -86,39 +80,27 @@ class ExtractSwapSdrDataFromKdb:
 
     def get_rfq_data_from_kdb(self) -> pd.DataFrame:
         query = self._get_rfq_query()
-        df = kx.q(
-            query,
-            self.gateway_connection,
-            self.start_date,
-            self.end_date,
-        )
-        df = df.pd().reset_index()
-        for col in [RfqColumns.requestId.value, RfqColumns.clientName.value, RfqColumns.legInstrumentName.value]:
+        df = kx.q(query, self.gateway_connection, self.start_date, self.end_date).pd().reset_index()
+        
+        for col in [RfqColumns.requestId.value, RfqColumns.legInstrumentName.value]:
             df[col] = df[col].str.decode("utf-8")
 
         df_price_trace = self.get_rfq_price_trace_from_kdb(rfqIds=df[RfqColumns.requestId.value])
         df = pd.merge(df, df_price_trace, on=[RfqColumns.requestId.value])
+        
         df.loc[df["legPricingConvention"] == "RateQuoted", "parentMidFromPriceTrace"] = (
             df.loc[df["legPricingConvention"] == "RateQuoted", "parentMidFromPriceTrace"] / 100
         )
         df["parentMidFromPriceTrace"] = abs(df["parentMidFromPriceTrace"]) * np.sign(df["parentQuotePrice"])
-        num_sef = df.loc[df["regulatoryScope"] == "SEF"].shape[0]
-        num_mtf = df.loc[df["regulatoryScope"] == "MTF"].shape[0]
+        
         logging.info(
-            f"There are {df.shape[0]} trades (legs) in RFQ between {self.start_date}-{self.end_date}. num SEF={num_sef}, num MTF={num_mtf} trades."
+            f"There are {df.shape[0]} trades (legs) in RFQ between {self.start_date}-{self.end_date}. "
+            f"num SEF={df.loc[df['regulatoryScope'] == 'SEF'].shape[0]}, num MTF={df.loc[df['regulatoryScope'] == 'MTF'].shape[0]} trades."
         )
         return df
 
     def _get_sdr_query(self):
-        """
-        SDR table is sometimes populated with a delay. We observe date >> ExecutionTimestamp.
-        For a given trade execution date, we then need to query a relatively large date range.
-        """
-
-        sym_constraint = (
-            f'.constr.FIELDLIKEANY[`sym; ("InterestRate:IRSwap:OIS"; "{self.CONSTRAINT_PREFIX[self.currency]}")] ,'
-        )
-
+        sym_constraint = f'.constr.FIELDLIKEANY[`sym; ("InterestRate:IRSwap:OIS"; "{self.CONSTRAINT_PREFIX[self.currency]}")] ,'
         query_sdr = (
             """{[rates;startDate;endDate]
                 startDateTime: "p"$startDate;
@@ -131,7 +113,6 @@ class ExtractSwapSdrDataFromKdb:
                         """
             + sym_constraint
             + """
-                        // The change in sym values occurred on 2024-01-27
                         .constr.FIELD[`NotionalCurrencyLeg1; `"""
             + self.currency.value
             + """],
@@ -158,16 +139,8 @@ class ExtractSwapSdrDataFromKdb:
                         .istat.FIELDAS[`MandatoryClearingIndicator; `ExecutionVenue],
                         .istat.FIELDAS[`ExpirationDate; `legInstrumentMaturityDate],
                         .istat.FIELDAS[`EffectiveDate; `legSwapEffectiveDate]);
-                data: update sdrLegPrice: 100*PriceNotation from data where not null PriceNotation;
-                data: update sdrLegPrice: 100*AdditionalPriceNotation from data where not null AdditionalPriceNotation;
-                data: update PackageTransactionPrice: OtherPaymentAmount from data where null PackageTransactionPrice;
-                data: update ResetFrequency1: (FloatingRateResetFrequencyPeriodMultiplierLeg1, 'FloatingRateResetFrequencyPeriodLeg1) from data where not null FloatingRateResetFrequencyPeriodMultiplierLeg1;
-                data: update ResetFrequency2: (FloatingRateResetFrequencyPeriodMultiplierLeg2, 'FloatingRateResetFrequencyPeriodLeg2) from data where not null FloatingRateResetFrequencyPeriodMultiplierLeg2;
-                data: update FixedPaymentFrequency1: (FixedRatePaymentFrequencyPeriodMultiplierLeg1, 'FixedRatePaymentFrequencyPeriodLeg1) from data where not null FixedRatePaymentFrequencyPeriodMultiplierLeg1;
-                data: update FloatingPaymentFrequency1: (FloatingRatePaymentFrequencyPeriodMultiplierLeg1, 'FloatingRatePaymentFrequencyPeriodLeg1) from data where not null FloatingRatePaymentFrequencyPeriodMultiplierLeg1;
-                data: update FixedPaymentFrequency2: (FixedRatePaymentFrequencyPeriodMultiplierLeg2, 'FixedRatePaymentFrequencyPeriodLeg2) from data where not null FixedRatePaymentFrequencyPeriodMultiplierLeg2;
-                data: update FloatingPaymentFrequency2: (FloatingRatePaymentFrequencyPeriodMultiplierLeg2, 'FloatingRatePaymentFrequencyPeriodLeg2) from data where not null FloatingRatePaymentFrequencyPeriodMultiplierLeg2;
-                data: select from data where ((not null sdrLegPrice) or (not null PackageTransactionPrice));
+                
+                data: select from data where ((not null PriceNotation) or (not null AdditionalPriceNotation) or (not null PackageTransactionPrice) or (not null OtherPaymentAmount));
                 data: update numLegs: count i by sdrExecutionTimestamp from data
             }"""
         )
@@ -175,7 +148,6 @@ class ExtractSwapSdrDataFromKdb:
 
     def _get_rfq_price_trace_query(self) -> str:
         price_trace_table_name = ".swapstrading." + self.region + ".SMMPriceTrace;"
-
         query = (
             """
             {[rates;startDate;endDate;rfqs]
@@ -199,31 +171,14 @@ class ExtractSwapSdrDataFromKdb:
 
     def get_sdr_data_from_kdb(self) -> pd.DataFrame:
         query = self._get_sdr_query()
-        df = kx.q(
-            query,
-            self.gateway_connection,
-            self.start_date,
-            self.end_date,
-        )
-        df = df.pd()
-        numpy_mask_columns = [
-            "FixedRatePaymentFrequencyPeriodMultiplierLeg1",
-            "FixedRatePaymentFrequencyPeriodMultiplierLeg2",
-            "FloatingRatePaymentFrequencyPeriodMultiplierLeg1",
-            "FloatingRatePaymentFrequencyPeriodMultiplierLeg2",
-            "FloatingRateResetFrequencyPeriodMultiplierLeg1",
-            "FloatingRateResetFrequencyPeriodMultiplierLeg2",
-        ]
-        df["legSwapFixedLegRate"] = df["sdrLegPrice"]
-        first_exec_time = min(df["sdrExecutionTimestamp"])
-        last_exec_time = max(df["sdrExecutionTimestamp"])
-        logging.info(f"There are {df.shape[0]} SDR trades executed between {first_exec_time} - {last_exec_time}.")
-        return df.drop(columns=numpy_mask_columns)
+        df = kx.q(query, self.gateway_connection, self.start_date, self.end_date).pd()
+        df["legSwapFixedLegRate"] = df["PriceNotation"] # Placeholder mapping for consistency
+        logging.info(f"There are {df.shape[0]} SDR trades executed between {df['sdrExecutionTimestamp'].min()} - {df['sdrExecutionTimestamp'].max()}.")
+        return df
 
     def get_rfq_price_trace_from_kdb(self, rfqIds) -> pd.DataFrame:
         query = self._get_rfq_price_trace_query()
-        df = kx.q(query, self.gateway_connection, self.start_date, self.end_date, list(set(rfqIds)))
-        df = df.pd().reset_index()
+        df = kx.q(query, self.gateway_connection, self.start_date, self.end_date, list(set(rfqIds))).pd().reset_index()
         df["parentMidFromPriceTrace"] = df["price"]
         df[RfqColumns.requestId.value] = df[RfqColumns.requestId.value].str.decode("utf-8")
         return df[[RfqColumns.requestId.value, "parentMidFromPriceTrace"]]
