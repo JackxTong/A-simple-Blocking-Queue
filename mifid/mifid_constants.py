@@ -4,19 +4,21 @@ class MifidMatchingConfiguration:
     NOTIONAL_TOLERANCE = 1e-4
 
 class MifidColumns(Enum):
-    tradingDateTime = "Trading Date Time"
+    tradingDateTime = "tradingDateTime"
     notionalAmount = "Notional Amount"
     drvExpiryDate = "Drv Expiry Date"
     price = "Price"
     drvExpiryYear = "Drv Expiry Year"
 
 class RfqColumns(Enum):
-    dateTime = "Date Time"
+    dateTime = "soruceTimeStamp"
     datetime_parsed = "datetime"
     date = "date"
-    rfqId = "rfqId"
+    rfqId = "requestId"
     sizeK = "Size (k)"
     legInstrumentMaturityDate = "legInstrumentMaturityDate"
+    regulatoryScope = "regulatoryScope"
+    venue = "venue"
     
 class MatchAttributes(Enum):
     MATCH = "Match"
