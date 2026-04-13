@@ -16,7 +16,7 @@ from swaps_analytics.irs.mifid_matching.mifid_matching_utils import (
     tie_breaking_closest_time
 )
 
-# Configure logging at the module level
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class MifidDataMatchingAlgorithm:
@@ -29,9 +29,6 @@ class MifidDataMatchingAlgorithm:
         regulatory_scope: str = "SEF",
         debug_mode: bool = False
     ):
-        """
-        Class to match internal RFQ data against public MiFID tape data.
-        """
         self.backward_timedelta = backward_timedelta
         self.forward_timedelta = forward_timedelta
         self.regulatory_scope = regulatory_scope
@@ -71,13 +68,15 @@ class MifidDataMatchingAlgorithm:
                 self.rfq_data[RfqColumns.regulatoryScope.value] == self.regulatory_scope
             ]
 
-        # FIX 1: Create a concrete 1-row DataFrame to prevent NaN casting on False
+        # Base unmatched template including new confidence and tie-break tracking
         unmatched_defaults = pd.DataFrame({
             'mifid_price': [np.nan],
             'instrumentFullName': [np.nan],
             'Drv Expiry Year': [np.nan],
             'notionalAmount': [np.nan],
-            MatchAttributes.MATCH.value: [False]
+            MatchAttributes.MATCH.value: [False],
+            'tie_break_used': [False],
+            'matchConfidence': ["no_match"]
         })
 
         unique_dates = self.rfq_data[RfqColumns.date.value].unique()
@@ -86,7 +85,7 @@ class MifidDataMatchingAlgorithm:
             df_rfq_date = self.rfq_data[self.rfq_data[RfqColumns.date.value] == trade_date]
             matches_for_date = 0
 
-            # Pre-filter MiFID data
+            # Pre-filter MiFID data for the date
             mifid_date_base = self.mifid_data[self.mifid_data[MifidColumns.tradingDateTime.value].dt.date == trade_date]
 
             for request_id in tqdm(
@@ -94,98 +93,87 @@ class MifidDataMatchingAlgorithm:
                 desc=f"Matching MiFID Trades for {trade_date}",
                 leave=False
             ):
-                rfq_row = df_rfq_date[df_rfq_date['requestId'] == request_id].iloc[0]
+                # Isolate ALL legs for this specific request ID
+                rfq_legs = df_rfq_date[df_rfq_date['requestId'] == request_id]
+                request_id_results = []
                 
-                # FIX 2: Instantiate rfq_row_df at the TOP of the loop so failures capture the correct row
-                rfq_row_df = pd.DataFrame([rfq_row]).reset_index(drop=True)
+                logging.debug(f"\n--- Matching RFQ ID: {request_id} ({len(rfq_legs)} legs) ---")
 
-                rfq_time = rfq_row[RfqColumns.datetime_parsed.value]
-                rfq_size = rfq_row['legSize']
-                rfq_maturity = rfq_row[RfqColumns.legInstrumentMaturityDate.value]
+                # Iterate through every leg of the current request ID
+                for idx, rfq_row in rfq_legs.iterrows():
+                    rfq_row_df = pd.DataFrame([rfq_row]).reset_index(drop=True)
 
-                logging.debug(f"\n--- Matching RFQ ID: {request_id} ---")
-                
-                # Helper function to streamline the unmatched logic
-                def handle_unmatched_state(filter_name):
-                    logging.debug(f"Failed at {filter_name} filter. Appending unmatched row for ID {request_id}.")
-                    combined_match = pd.concat([rfq_row_df, unmatched_defaults], axis=1)
-                    matched_results.append(combined_match)
+                    rfq_time = rfq_row[RfqColumns.datetime_parsed.value]
+                    rfq_size = rfq_row['legSize']
+                    rfq_maturity = rfq_row[RfqColumns.legInstrumentMaturityDate.value]
 
-                initial_len = len(mifid_date_base)
+                    def handle_unmatched_state(filter_name):
+                        logging.debug(f"Leg {idx} failed at {filter_name} filter.")
+                        combined_match = pd.concat([rfq_row_df, unmatched_defaults], axis=1)
+                        request_id_results.append(combined_match)
 
-                # 1. Filter by Time Window
-                mifid_filtered = filter_mifid_by_time_window(
-                    df_mifid=mifid_date_base,
-                    time_col=MifidColumns.tradingDateTime.value,
-                    ref_time=rfq_time,
-                    backward_mins=self.backward_timedelta,
-                    forward_mins=self.forward_timedelta
-                )
+                    # 1. Filter by Time Window
+                    mifid_filtered = filter_mifid_by_time_window(
+                        df_mifid=mifid_date_base, time_col=MifidColumns.tradingDateTime.value,
+                        ref_time=rfq_time, backward_mins=self.backward_timedelta, forward_mins=self.forward_timedelta
+                    )
+                    if mifid_filtered.empty:
+                        handle_unmatched_state("Time Window")
+                        continue
 
-                current_len = len(mifid_filtered)
-                logging.debug(f"1. Time Window Filter   | Filtered out: {initial_len - current_len:<5} | Left: {current_len}")
+                    # 2. Filter by Exact Notional (Must pass regardless of row count)
+                    mifid_filtered = filter_mifid_by_exact_notional(
+                        df_mifid=mifid_filtered, notional_col=MifidColumns.notionalAmount.value,
+                        ref_notional=rfq_size, tolerance=config.NOTIONAL_TOLERANCE
+                    )
+                    if mifid_filtered.empty:
+                        handle_unmatched_state("Exact Notional")
+                        continue
 
-                if mifid_filtered.empty:
-                    handle_unmatched_state("Time Window")
-                    continue
-
-                initial_len = current_len
-
-                # 4. Filter by Exact Notional
-                mifid_filtered = filter_mifid_by_exact_notional(
-                    df_mifid=mifid_filtered,
-                    notional_col=MifidColumns.notionalAmount.value,
-                    ref_notional=rfq_size,
-                    tolerance=config.NOTIONAL_TOLERANCE
-                )
-
-                current_len = len(mifid_filtered)
-                logging.debug(f"4. Exact Notional Filter| Filtered out: {initial_len - current_len:<5} | Left: {current_len}")
-
-                if mifid_filtered.empty:
-                    handle_unmatched_state("Exact Notional")
-                    continue
-
-                initial_len = current_len
-
-                # 5. Filter by Maturity Year
-                if len(mifid_filtered) > 1:
+                    # 3. Filter by Maturity Year (Must pass regardless of row count)
                     mifid_filtered = filter_mifid_by_maturity_year(
-                        df_mifid=mifid_filtered,
-                        expiry_col=MifidColumns.drvExpiryYear.value,
+                        df_mifid=mifid_filtered, expiry_col=MifidColumns.drvExpiryYear.value,
                         ref_maturity_date=rfq_maturity
                     )
-                    current_len = len(mifid_filtered)
-                    logging.debug(f"5. Maturity Year Filter | Filtered out: {initial_len - current_len:<5} | Left: {current_len}")
+                    if mifid_filtered.empty:
+                        handle_unmatched_state("Maturity Year")
+                        continue
 
-                if mifid_filtered.empty:
-                    handle_unmatched_state("Maturity Year")
-                    continue
+                    # 4. Tie-Breaking Logic
+                    tie_break_triggered = len(mifid_filtered) > 1
+                    if tie_break_triggered:
+                        logging.debug(f"-> Tie-breaker needed for {len(mifid_filtered)} rows.")
+                        mifid_filtered = tie_breaking_closest_time(
+                            df_mifid=mifid_filtered, time_col=MifidColumns.tradingDateTime.value, ref_time=rfq_time
+                        )
 
-                # 6. Tie-Breaking Logic
-                if len(mifid_filtered) > 1:
-                    logging.debug(f"-> Tie-breaker needed for {len(mifid_filtered)} rows. Selecting closest time.")
-                    mifid_filtered = tie_breaking_closest_time(
-                        df_mifid=mifid_filtered,
-                        time_col=MifidColumns.tradingDateTime.value,
-                        ref_time=rfq_time
-                    )
+                    # Append Successful Match for this leg
+                    mifid_subset = mifid_filtered[self.mifid_cols_to_concat].reset_index(drop=True)
+                    mifid_subset = mifid_subset.rename(columns={'price': 'mifid_price'})
+                    
+                    combined_match = pd.concat([rfq_row_df, mifid_subset], axis=1)
+                    combined_match[MatchAttributes.MATCH.value] = True
+                    combined_match['tie_break_used'] = tie_break_triggered
+                    
+                    # Apply Confidence Logic immediately based on tie break status
+                    combined_match['matchConfidence'] = "simple_match" if tie_break_triggered else "perfect_match"
+                    
+                    matches_for_date += 1
+                    request_id_results.append(combined_match)
 
-                # Successful Match Processing
-                mifid_subset = mifid_filtered[self.mifid_cols_to_concat].reset_index(drop=True)
-                mifid_subset = mifid_subset.rename(columns={'price': 'mifid_price'})
+                # --- Post-Processing for the full Request ID (All Legs) ---
+                req_df = pd.concat(request_id_results, ignore_index=True)
                 
-                combined_match = pd.concat([rfq_row_df, mifid_subset], axis=1)
-                combined_match[MatchAttributes.MATCH.value] = True
-                matches_for_date += 1
+                # Check if ALL legs for this Request ID successfully matched
+                all_legs_matched = req_df[MatchAttributes.MATCH.value].all()
+                req_df['allLegsMatch'] = all_legs_matched
 
-                logging.debug(f"Successfully matched ID {request_id}. Appending shape {combined_match.shape}.")
-                matched_results.append(combined_match)
+                matched_results.append(req_df)
 
             # Record tracking stats
             date_match_rate = matches_for_date / len(df_rfq_date) if len(df_rfq_date) > 0 else 0
             self.match_rates_by_date.append({'Date': trade_date, 'MatchRate': date_match_rate})
-            logging.info(f"Matching rate for {trade_date}: {date_match_rate:.2%}")
+            logging.info(f"Match rate for {trade_date}: {date_match_rate:.2%}")
 
         if matched_results:
             return pd.concat(matched_results, ignore_index=True)
