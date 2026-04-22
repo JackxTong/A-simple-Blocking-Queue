@@ -9,6 +9,11 @@ class MifidColumns(Enum):
     drvExpiryDate = "Drv Expiry Date"
     price = "Price"
     drvExpiryYear = "Drv Expiry Year"
+    priceCurrency = "priceCurrency"
+    source = "source"
+    instrumentFullName = "instrumentFullName"
+    cfiGroupName = "cfiGroupName"
+    drvUnderlyingIndexName = "drvUnderlyingIndexName"
 
 class RfqColumns(Enum):
     dateTime = "soruceTimeStamp"
@@ -19,6 +24,20 @@ class RfqColumns(Enum):
     legInstrumentMaturityDate = "legInstrumentMaturityDate"
     regulatoryScope = "regulatoryScope"
     venue = "venue"
+    numLegs = "numLegs"
+    endReason = "endReason"
+    legIndex = "legIndex"
+
+class ColumnUtils(Enum):
+    modelVersion = "modelVersion"
+    runDateTime = "runDateTime"
+    MATCH = "Match"
+    MATCH_CONFIDENCE = "MatchConfidence"
+
+class EndReason(Enum):
+    COUNTERPARTY_TRADED_WITH_BARCLAYS = "COUNTERPARTY_TRADED_WITH_BARCLAYS"
+    COUNTERPARTY_TRADED_AWAY = "COUNTERPARTY_TRADED_AWAY"
+    CLIENT_REJECTED = "CLIENT_REJECTED"
     
 class MatchAttributes(Enum):
     MATCH = "Match"
